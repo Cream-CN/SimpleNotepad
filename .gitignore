@@ -69,3 +69,7 @@ Testing/
 
 #watcom
 .err
+#vim
+.un~
+.md~
+.c~
