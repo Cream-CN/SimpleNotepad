@@ -5,6 +5,7 @@
  *
  * Compilers: TCC, Open Watcom, MSVC, GCC (MinGW)
  * Target: 32-bit PE (Win32)
+ * Pseudo-MDI (multi-process taskbar grouping)
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -19,13 +20,15 @@
 
 #define CLASS_NAME "SimpleNotepad"
 #define APP_NAME   "Simple Notepad"
+#define APP_USER_MODEL_ID "CreamCN.SimpleNotepad"
 
 #define ID_EDIT            1001
 #define ID_FILE_NEW        2001
-#define ID_FILE_OPEN       2002
-#define ID_FILE_SAVE       2003
-#define ID_FILE_SAVEAS     2004
-#define ID_FILE_EXIT       2005
+#define ID_FILE_NEWWINDOW  2002
+#define ID_FILE_OPEN       2003
+#define ID_FILE_SAVE       2004
+#define ID_FILE_SAVEAS     2005
+#define ID_FILE_EXIT       2006
 #define ID_EDIT_UNDO       3001
 #define ID_EDIT_CUT        3002
 #define ID_EDIT_COPY       3003
@@ -98,6 +101,9 @@ static BOOL DoFileSaveAs(HWND);
 static BOOL ReadFileContent(HWND, const char *);
 static BOOL WriteFileContent(HWND, const char *);
 static void HandleCommand(HWND, int);
+static void SetAppUserModelId(void);
+static void DoFileNewWindow(HWND);
+static void OpenFileFromCommandLine(LPSTR);
 
 /* ============================================================================
  * 5. Helper Functions
@@ -136,6 +142,107 @@ static void SafeStrCopy(char *dest, const char *src, int maxLen)
 }
 
 /* ============================================================================
+ * 5b. Pseudo-MDI Support (Taskbar Grouping, Windows 7+)
+ * ============================================================================ */
+
+typedef HRESULT (WINAPI *PFN_SetAppID)(PCWSTR);
+
+/*
+ * 动态加载 shell32.dll 里的 SetCurrentProcessExplicitAppUserModelID。
+ * Win7+ 生效；Win95~Vista 上函数不存在，自动跳过，退化为普通多进程。
+ * C89：所有变量在块首声明。
+ */
+static void SetAppUserModelId(void)
+{
+    HMODULE hShell32;
+    PFN_SetAppID pfnSetAppID;
+    WCHAR wszAppId[64];
+    const char *p;
+    int i;
+
+    hShell32 = LoadLibraryA("shell32.dll");
+    if (hShell32 == NULL)
+        return;
+
+    pfnSetAppID = (PFN_SetAppID)GetProcAddress(hShell32,
+                    "SetCurrentProcessExplicitAppUserModelID");
+
+    if (pfnSetAppID != NULL) {
+        p = APP_USER_MODEL_ID;
+        for (i = 0; i < 63 && p[i] != '\0'; i++)
+            wszAppId[i] = (WCHAR)(unsigned char)p[i];
+        wszAppId[i] = L'\0';
+
+        pfnSetAppID(wszAppId);
+    }
+}
+
+/*
+ * 启动一个新进程，不带文件名。
+ * 新进程会得到同样的 AppID，任务栏自动分组（Win7+）。
+ * C89：STARTUPINFOA / PROCESS_INFORMATION 在块首声明。
+ */
+static void DoFileNewWindow(HWND hWnd)
+{
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char szExe[MAX_PATH];
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!GetModuleFileNameA(NULL, szExe, MAX_PATH))
+        return;
+
+    if (CreateProcessA(szExe, NULL, NULL, NULL, FALSE,
+                       0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else {
+        MessageBox(hWnd, "Cannot start new window!", "Error",
+                   MB_OK | MB_ICONERROR);
+    }
+}
+
+/*
+ * 解析命令行，打开文件。
+ * 支持带引号和不带引号的路径，跳过前导空白。
+ * C89：无 size_t 问题，改用 int 计数。
+ */
+static void OpenFileFromCommandLine(LPSTR lpCmdLine)
+{
+    char *p;
+    int len;
+
+    if (lpCmdLine == NULL || lpCmdLine[0] == '\0')
+        return;
+
+    p = lpCmdLine;
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    if (*p == '"') {
+        p++;
+        len = (int)strlen(p);
+        if (len > 0 && p[len - 1] == '"')
+            p[len - 1] = '\0';
+    }
+
+    if (p[0] == '\0')
+        return;
+
+    if (ReadFileContent(g_ctx.hWnd, p)) {
+        SafeStrCopy(g_ctx.szFileName, p, MAX_PATH);
+        g_ctx.bFileModified = FALSE;
+        UpdateWindowTitle(g_ctx.hWnd);
+    } else {
+        MessageBox(g_ctx.hWnd, "Cannot open file from command line!",
+                   "Error", MB_OK | MB_ICONERROR);
+    }
+}
+
+/* ============================================================================
  * 6. Entry Point
  * ============================================================================ */
 
@@ -145,7 +252,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     MSG msg;
 
     (void)hPrevInstance;
-    (void)lpCmdLine;
+
+    /* 伪 MDI：设置 AppID，让任务栏分组（Win7+ 生效） */
+    SetAppUserModelId();
 
     /* No common controls are used, so no InitCommonControlsEx() call.
        This keeps Win95 compatibility (InitCommonControlsEx is Win98+/IE4+). */
@@ -154,6 +263,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 0;
     if (!InitInstance(hInstance, nCmdShow))
         return 0;
+
+    /* 命令行带文件名则打开 */
+    OpenFileFromCommandLine(lpCmdLine);
 
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
@@ -236,12 +348,13 @@ static BOOL CreateMainMenu(HWND hWnd)
         return FALSE;
     }
 
-    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_NEW,    "&New\tCtrl+N");
-    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_OPEN,   "&Open\tCtrl+O");
-    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_SAVE,   "&Save\tCtrl+S");
-    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_SAVEAS, "Save &As...");
-    AppendMenu(hFileMenu, MF_SEPARATOR, 0,              NULL);
-    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_EXIT,   "E&xit");
+    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_NEW,       "&New\tCtrl+N");
+    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_NEWWINDOW, "New &Window");
+    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_OPEN,      "&Open\tCtrl+O");
+    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_SAVE,      "&Save\tCtrl+S");
+    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_SAVEAS,    "Save &As...");
+    AppendMenu(hFileMenu, MF_SEPARATOR, 0,                 NULL);
+    AppendMenu(hFileMenu, MF_STRING,    ID_FILE_EXIT,      "E&xit");
 
     hEditMenu = CreatePopupMenu();
     if (hEditMenu == NULL) {
@@ -555,6 +668,7 @@ static void ShowAboutDialog(HWND hWnd)
         "  Build Date: " __DATE__ "\n"
         "  Build Time: " __TIME__ "\n\n"
         "Win32 ANSI, strict C89\n"
+        "Pseudo-MDI (multi-process)\n"
         "Windows 95 through Windows 11");
 
     MessageBox(hWnd, szAbout, "About", MB_OK | MB_ICONINFORMATION);
@@ -567,11 +681,12 @@ static void ShowAboutDialog(HWND hWnd)
 static void HandleCommand(HWND hWnd, int wmId)
 {
     switch (wmId) {
-    case ID_FILE_NEW:    DoFileNew(hWnd);    break;
-    case ID_FILE_OPEN:   DoFileOpen(hWnd);   break;
-    case ID_FILE_SAVE:   DoFileSave(hWnd);   break;
-    case ID_FILE_SAVEAS: DoFileSaveAs(hWnd); break;
-    case ID_FILE_EXIT:   PostMessage(hWnd, WM_CLOSE, 0, 0); break;
+    case ID_FILE_NEW:       DoFileNew(hWnd);       break;
+    case ID_FILE_NEWWINDOW: DoFileNewWindow(hWnd); break;
+    case ID_FILE_OPEN:      DoFileOpen(hWnd);      break;
+    case ID_FILE_SAVE:      DoFileSave(hWnd);      break;
+    case ID_FILE_SAVEAS:    DoFileSaveAs(hWnd);    break;
+    case ID_FILE_EXIT:      PostMessage(hWnd, WM_CLOSE, 0, 0); break;
 
     case ID_EDIT_UNDO:      SendMessage(g_ctx.hEdit, WM_UNDO,    0, 0); break;
     case ID_EDIT_CUT:       SendMessage(g_ctx.hEdit, WM_CUT,     0, 0); break;
